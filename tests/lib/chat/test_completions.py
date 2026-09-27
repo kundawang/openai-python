@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import gc
+import weakref
+import contextvars
 from enum import Enum
 from typing import List, Optional
 from typing_extensions import Literal, TypeVar
@@ -12,7 +15,10 @@ import openai
 from openai import OpenAI, AsyncOpenAI
 from tests.respx2 import MockRouter
 from openai._utils import assert_signatures_in_sync
-from openai._compat import PYDANTIC_V1
+from openai._compat import PYDANTIC_V1, model_parse
+from openai.types.chat import ChatCompletion, ChatCompletionChunk
+from openai.lib.streaming.chat import ChatCompletionStreamState
+from openai.lib._parsing._completions import parse_chat_completion
 
 from ..utils import print_obj
 from ...conftest import base_url
@@ -1015,3 +1021,117 @@ def test_parse_method_in_sync(sync: bool, client: OpenAI, async_client: AsyncOpe
         checking_client.chat.completions.parse,
         exclude_params={"response_format", "stream"},
     )
+
+
+class _LeakProbeModel(BaseModel):
+    name: str
+
+
+def _make_raw_completion() -> ChatCompletion:
+    return model_parse(
+        ChatCompletion,
+        {
+            "id": "chatcmpl-leak-probe",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o-2024-08-06",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": '{"name": "x"}'},
+                }
+            ],
+        },
+    )
+
+
+def _make_stream_chunks() -> List[ChatCompletionChunk]:
+    return [
+        model_parse(
+            ChatCompletionChunk,
+            {
+                "id": "chatcmpl-leak-probe",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "gpt-4o-2024-08-06",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": '{"name":'},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+        ),
+        model_parse(
+            ChatCompletionChunk,
+            {
+                "id": "chatcmpl-leak-probe",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "gpt-4o-2024-08-06",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": ' "x"}'},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        ),
+    ]
+
+
+def _parse_via_parse_and_stream() -> None:
+    completion = parse_chat_completion(
+        response_format=_LeakProbeModel,
+        input_tools=[],
+        chat_completion=_make_raw_completion(),
+    )
+    assert completion.choices[0].message.parsed == _LeakProbeModel(name="x")
+
+    state = ChatCompletionStreamState(response_format=_LeakProbeModel)
+    for chunk in _make_stream_chunks():
+        state.handle_chunk(chunk)
+    streamed = state.get_final_completion()
+    assert streamed.choices[0].message.parsed == _LeakProbeModel(name="x")
+
+
+def _pydantic_schema_object_count() -> int:
+    gc.collect()
+    return sum(1 for obj in gc.get_objects() if type(obj).__name__ in ("SchemaValidator", "SchemaSerializer"))
+
+
+def test_parse_does_not_retain_response_or_schema_objects() -> None:
+    # populate the caches that are legitimately initialized once
+    _parse_via_parse_and_stream()
+
+    # the parsed response and its parsed content must be garbage-collectable
+    completion = parse_chat_completion(
+        response_format=_LeakProbeModel,
+        input_tools=[],
+        chat_completion=_make_raw_completion(),
+    )
+    parsed = completion.choices[0].message.parsed
+    assert parsed is not None
+    completion_ref = weakref.ref(completion)
+    parsed_ref = weakref.ref(parsed)
+    del completion
+    del parsed
+    gc.collect()
+    assert completion_ref() is None
+    assert parsed_ref() is None
+
+    if PYDANTIC_V1:
+        # the SchemaValidator/SchemaSerializer retention probe below is pydantic v2 specific
+        return
+
+    # repeated parse calls (including the streaming path, which shares
+    # `parse_chat_completion`) must not retain fresh pydantic schema objects;
+    # each call runs in a fresh context because pydantic's generic cache is
+    # context-scoped and a shared context would hide the retention
+    before = _pydantic_schema_object_count()
+    for _ in range(25):
+        contextvars.Context().run(_parse_via_parse_and_stream)
+    assert _pydantic_schema_object_count() == before

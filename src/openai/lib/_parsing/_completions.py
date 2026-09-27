@@ -148,7 +148,10 @@ def parse_chat_completion(
 
         choices.append(
             construct_type_unchecked(
-                type_=ParsedChoice[ResponseFormatT],
+                # Keep generic annotations in quoted casts: runtime specialization with a
+                # free TypeVar makes `model_rebuild` fail, so pydantic never populates its
+                # schema cache and retains a fresh SchemaValidator/SchemaSerializer per call.
+                type_=cast("type[ParsedChoice[ResponseFormatT]]", ParsedChoice),
                 value={
                     **choice.to_dict(),
                     "message": {
@@ -164,7 +167,7 @@ def parse_chat_completion(
         )
 
     return construct_type_unchecked(
-        type_=ParsedChatCompletion[ResponseFormatT],
+        type_=cast("type[ParsedChatCompletion[ResponseFormatT]]", ParsedChatCompletion),
         value={
             **chat_completion.to_dict(),
             "choices": choices,
